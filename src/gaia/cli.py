@@ -1193,6 +1193,16 @@ def build_parser():
         help="With -p: cap on agent steps (default: the agent's own limit)",
     )
     parser.add_argument(
+        "--attempts",
+        dest="print_attempts",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="With -p: run N (up to 4) independent attempts, each in a copy of the "
+        "current folder, then one more that checks and combines them. Better "
+        "reviews and answers for about N+1 times the tokens",
+    )
+    parser.add_argument(
         "--dangerously-skip-permissions",
         dest="print_skip_permissions",
         action="store_true",
@@ -1849,7 +1859,7 @@ def build_parser():
     # Schedule command — cron-based recurring skill/prompt dispatch (issue #892)
     schedule_parser = subparsers.add_parser(
         "schedule",
-        help="Run a skill or prompt on a cron schedule "
+        help="Run a prompt on a cron schedule or once at a set time "
         "(add|list|show|remove|pause|resume|run|daemon)",
         parents=[parent_parser],
     )
@@ -1859,11 +1869,17 @@ def build_parser():
 
     s_add = schedule_subparsers.add_parser("add", help="Register a new schedule")
     s_add.add_argument("--name", required=True, help="Unique schedule name")
-    s_add.add_argument(
-        "--cron", required=True, help='Cron expression, e.g. "0 7 * * 1-5"'
+    s_add_when = s_add.add_mutually_exclusive_group(required=True)
+    s_add_when.add_argument(
+        "--cron", help='Repeat on a cron expression, e.g. "0 7 * * 1-5"'
+    )
+    s_add_when.add_argument(
+        "--at",
+        help="Run once: an ISO datetime (local time unless it has an offset), "
+        'e.g. "2026-11-02T09:00", or a delay like +30m, +2h, +1d12h',
     )
     s_add_what = s_add.add_mutually_exclusive_group(required=True)
-    s_add_what.add_argument("--prompt", help="One-shot prompt to run on each fire")
+    s_add_what.add_argument("--prompt", help="Prompt to run on each fire")
     s_add_what.add_argument(
         "--skill",
         help="Skill to run — the scheduler is not wired to the skills runtime "
@@ -3713,7 +3729,7 @@ Examples:
 
     skills_cli.add_subparser(subparsers)
 
-    # Local GGUF models added from a Hugging Face link (shared with the Agent UI and TUI).
+    # Local models added from a Hugging Face link (shared with the Agent UI and TUI).
     from gaia.llm import custom_models_cli
 
     custom_models_cli.add_subparser(subparsers)
@@ -4577,13 +4593,16 @@ def _handle_eval_tasks(args):
             f"<run_dir> --propose {expect_path}` from a run of main to gate this model."
         )
         return
-    unmeasured = ft.summarize(card)["unmeasured"]
+    summary = ft.summarize(card)
+    unmeasured, contaminated = summary["unmeasured"], summary["contaminated"]
     missed = [c.metric for c in checks if not c.ok]
     if unmeasured:
         problem = (
             f"{unmeasured} task(s) not measured: the model backend was unreachable. "
             "That is an infrastructure failure, not a verdict on the agent; re-run."
         )
+        if contaminated:
+            problem += f" {contaminated} task(s) also read the answer key."
     elif missed:
         problem = f"Missed expectations: {', '.join(missed)}."
     else:
@@ -4618,8 +4637,9 @@ def _handle_schedule(args):
                 "is not wired to it, so a skill-backed schedule would never produce "
                 "output.\n"
                 "Use --prompt instead, e.g.:\n"
-                f'  gaia schedule add --name {args.name} --cron "{args.cron}" '
-                '--prompt "<text>"\n'
+                f"  gaia schedule add --name {args.name} "
+                + (f'--at "{args.at}"' if args.at else f'--cron "{args.cron}"')
+                + ' --prompt "<text>"\n'
                 "Track progress: https://github.com/amd/gaia/issues/1019",
                 file=sys.stderr,
             )
@@ -4629,14 +4649,24 @@ def _handle_schedule(args):
         # disk (#4143).
         from apscheduler.triggers.cron import CronTrigger
 
-        try:
-            CronTrigger.from_crontab(args.cron)
-        except ValueError as exc:
-            print(
-                f"❌ '{args.cron}' is not a valid cron expression: {exc}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        from gaia.schedule.store import parse_at
+
+        at = None
+        if args.at:
+            try:
+                at = parse_at(args.at).isoformat()
+            except ValueError as exc:
+                print(f"❌ Cannot add schedule {args.name!r}: {exc}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            try:
+                CronTrigger.from_crontab(args.cron)
+            except ValueError as exc:
+                print(
+                    f"❌ '{args.cron}' is not a valid cron expression: {exc}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         sink_args = {}
         if getattr(args, "to", None):
             sink_args["to"] = args.to
@@ -4650,13 +4680,20 @@ def _handle_schedule(args):
         schedule = Schedule(
             name=args.name,
             cron=args.cron,
+            at=at,
             skill=getattr(args, "skill", None),
             prompt=getattr(args, "prompt", None),
             sink=args.sink,
             sink_args=sink_args,
         )
         store.add(schedule)
-        print(f"✅ Added schedule {schedule.name!r} ({schedule.cron})")
+        if schedule.one_shot:
+            print(
+                f"✅ Added one-time schedule {schedule.name!r} "
+                f"(runs once at {schedule_daemon.next_fire(schedule)})"
+            )
+        else:
+            print(f"✅ Added schedule {schedule.name!r} ({schedule.cron})")
         return
 
     if action == "list":
@@ -4666,9 +4703,10 @@ def _handle_schedule(args):
             return
         for s in schedules.values():
             state = "enabled" if s.enabled else "paused"
-            nxt = schedule_daemon.next_fire_time(s.cron) if s.enabled else None
+            nxt = schedule_daemon.next_fire(s)
+            when = f"once={s.state}" if s.one_shot else f"cron={s.cron!r}"
             print(
-                f"{s.name}  [{state}]  cron={s.cron!r}  sink={s.sink}"
+                f"{s.name}  [{state}]  {when}  sink={s.sink}"
                 + (f"  next={nxt}" if nxt else "")
                 + (f"  missed={s.missed_count}" if s.missed_count else "")
             )
@@ -4677,7 +4715,11 @@ def _handle_schedule(args):
     if action == "show":
         s = store.get(args.name)
         print(f"name:       {s.name}")
-        print(f"cron:       {s.cron}")
+        if s.one_shot:
+            print(f"once at:    {s.due_at().astimezone().isoformat()}")
+            print(f"state:      {s.state}")
+        else:
+            print(f"cron:       {s.cron}")
         print(f"target:     {'skill=' + s.skill if s.skill else 'prompt=' + s.prompt}")
         print(f"sink:       {s.sink}  args={s.sink_args}")
         print(f"enabled:    {s.enabled}")
@@ -4688,7 +4730,14 @@ def _handle_schedule(args):
             return _datetime.fromisoformat(stamp).astimezone().isoformat()
 
         print(f"created_at: {_local(s.created_at) if s.created_at else ''}")
-        print(f"next_fire:  {schedule_daemon.next_fire_time(s.cron)}")
+        if s.one_shot and s.last_run:
+            print(f"ran_at:     {_local(s.last_run)}")
+        nxt = (
+            schedule_daemon.next_fire(s)
+            if s.one_shot
+            else schedule_daemon.next_fire_time(s.cron)
+        )
+        print(f"next_fire:  {nxt}")
         if s.missed_count:
             runs = "run" if s.missed_count == 1 else "runs"
             count = (
@@ -4716,6 +4765,20 @@ def _handle_schedule(args):
         from datetime import datetime, timezone
 
         schedule = store.get(args.name)
+        if schedule.one_shot:
+            claimed = store.claim_one_shot(
+                schedule.name, datetime.now(timezone.utc), due_only=False
+            )
+            if claimed is None:
+                print(
+                    f"❌ One-time schedule {schedule.name!r} already ran "
+                    f"(state: {schedule.state}). Remove it and add it again to "
+                    "run it once more.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            schedule_daemon.run_one_shot(claimed, store)
+            return
         schedule_runner.fire(schedule)
         store.mark_run(
             schedule.name,
@@ -4860,6 +4923,7 @@ def main():
         "--output-format": args.print_output_format is not None,
         "--verbose": args.print_verbose,
         "--max-steps": args.print_max_steps is not None,
+        "--attempts": args.print_attempts is not None,
         "--dangerously-skip-permissions": args.print_skip_permissions,
         "--full-access": args.print_full_access,
     }
@@ -4886,6 +4950,11 @@ def main():
             parser.error(f"-p runs headless; {', '.join(launcher_flags)} cannot apply.")
         if args.print_verbose and args.print_output_format != "json":
             parser.error("--verbose adds the conversation to --output-format json.")
+        if args.print_attempts:
+            from gaia.attempts import MAX_ATTEMPTS
+
+            if args.print_attempts > MAX_ATTEMPTS:
+                parser.error(f"--attempts takes 1 to {MAX_ATTEMPTS}.")
         from gaia.print_mode import run as run_print_mode
 
         sys.exit(
@@ -4895,6 +4964,7 @@ def main():
                 output_format=args.print_output_format or "text",
                 verbose=args.print_verbose,
                 max_steps=args.print_max_steps,
+                attempts=args.print_attempts or 1,
                 skip_permissions=args.print_skip_permissions,
                 full_access=args.print_full_access,
                 base_url=args.base_url,
@@ -6078,6 +6148,20 @@ Let me know your answer!
                     ctx_size=args.ctx_size,
                 )
 
+            # An overflowed run measured nothing; summarizing it would print a
+            # 0.0 accuracy that reads like a quality collapse.
+            overflowed = [
+                r for r in results if r.get("error_kind") == "context_overflow"
+            ]
+            if overflowed:
+                print(
+                    f"[ERROR] {len(overflowed)} of {len(results)} experiment(s) hit "
+                    "the context window, so no scorecard was written for any of "
+                    f"them. {overflowed[0]['remedy']}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
             run_id = f"bench-{args.model.replace('/', '-').lower()}"
             summary = summarize_benchmark(results, run_id=run_id)
             perf = summary["scorecard"]["performance"]
@@ -6644,6 +6728,12 @@ def handle_email_command(args):
         print(dest)
         sys.exit(0)
 
+    # Every email route relays through the daemon, including autonomy controls.
+    # Check its runtime dependencies before probing Lemonade or making a relay
+    # request, so a base install gets the actionable [api] remedy instead of
+    # "daemon exited early".
+    _check_daemon_deps()
+
     # autonomy: a REST thin client over the daemon relay (#2516) — status/
     # trust/set-level/pause/resume/kill need no LLM at all, and `run` does its
     # own Lemonade check inside the sidecar call, so short-circuit here too.
@@ -6764,6 +6854,36 @@ def _print_autonomy_status(body: dict) -> None:
         f"threshold={threshold} "
         f"trusted_scopes={scope_count}"
     )
+    _print_last_autonomy_cycle(body.get("last_cycle"))
+
+
+def _print_last_autonomy_cycle(last) -> None:
+    # Same whitelist contract as _print_autonomy_status.
+    if not isinstance(last, dict):
+        print("last cycle: none has run yet")
+        return
+    from datetime import datetime
+
+    finished = float(last.get("finished_at") or 0.0)
+    started = float(last.get("started_at") or finished)
+    when = datetime.fromtimestamp(finished).strftime("%Y-%m-%d %H:%M:%S")
+    took = max(0.0, finished - started)
+    level = str(last.get("level"))
+    if last.get("outcome") != "completed":
+        print(f"last cycle: FAILED at {when} after {took:.0f}s (level {level})")
+        print(f"  error: {str(last.get('error'))}")
+        return
+    print(f"last cycle: completed at {when} in {took:.0f}s (level {level})")
+    print(
+        f"  executed={int(last.get('executed') or 0)} "
+        f"proposals={int(last.get('proposals') or 0)} "
+        f"skipped={int(last.get('skipped') or 0)} "
+        f"already_proposed={int(last.get('already_proposed') or 0)} "
+        f"errors={int(last.get('errors') or 0)}"
+    )
+    stopped = last.get("stopped")
+    if stopped:
+        print(f"  stopped early: {str(stopped)}")
 
 
 def _print_autonomy_trust(body: dict) -> None:
@@ -6808,7 +6928,7 @@ def handle_email_autonomy_command(args) -> None:
     through the daemon the same way every other ``gaia email`` command does
     (:mod:`gaia.daemon.agent_control`) — no second auth scheme.
     """
-    from gaia.daemon.agent_control import relay_json
+    from gaia.daemon.agent_control import may_still_be_running, relay_json
     from gaia.daemon.errors import DaemonError
 
     log = get_logger(__name__)
@@ -6894,6 +7014,13 @@ def handle_email_autonomy_command(args) -> None:
         # is cosmetic; a missing log record is not.
         log.error("email autonomy %s failed: %s", action, e)
         print(f"❌ {e}", file=sys.stderr)
+        if action == "run" and may_still_be_running(e):
+            print(
+                "   If the cycle started, it keeps running on the agent. Run "
+                f"`gaia email autonomy status --session-id {session_id}` to "
+                "see its result once it finishes.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     sys.exit(0)
@@ -9391,7 +9518,7 @@ def _check_daemon_deps():
     missing = missing_daemon_deps()
     if missing:
         print(
-            "❌ `gaia daemon` needs packages not in the base install: "
+            "❌ This command needs the GAIA daemon, whose packages are not in the base install: "
             + ", ".join(missing)
             + '.\n   Install the daemon extras:  pip install "amd-gaia[api]"'
             "  (or [ui], which adds the Agent UI's RAG stack on top)."

@@ -162,6 +162,16 @@ When an answer names a document from your library, the name is a link that
 opens the document, and each page it cites ("pages 175 and 205", "الصفحتان
 6–7") opens that page. In the desktop app they open in your web browser.
 
+### See Generated Images and Audio
+
+An image the agent generates shows in the answer; click it to see it full size.
+Music and sound effects it generates show a player with the file name and
+length (see [Local Music and Sound Effects](/guides/audio-generation)). Both
+still show when you reopen the chat. Only files GAIA saved in its own
+generation folders are shown this way. Speaking to GAIA through a microphone
+is not part of this; voice input is tracked in
+[#702](https://github.com/amd/gaia/issues/702).
+
 ---
 
 ## Install
@@ -575,8 +585,9 @@ GAIA asks before it changes files, runs commands or uses tools that act for you.
 The question appears above the message box with three answers:
 
 - **Allow once**
-- **Always allow** *this exact action* in this chat (offered only when the action
-  is narrow enough to name, e.g. *writing notes.md*)
+- **Always allow** the same kind of action in this chat. For a host-resolved
+  file write, this covers files in that folder; unresolved or safety-sensitive
+  paths stay exact and continue to prompt (e.g. *writing notes.md*)
 - **Deny**
 
 When the same question comes back after you allowed it once, the prompt says
@@ -647,14 +658,13 @@ reads nothing.
     shell tool, even under full access and even inside a wider folder, until
     you add it back. A document attached to the chat is removed from the
     document bar instead, which also takes it out of the chat's search.
-  - **Internet:** turn it off and GAIA won't search the web, open pages,
-    use the browser, connectors or your mailbox, search or install skills
-    from the Agent Hub, or run commands that go online (such as
-    `git push`, `pip install` or `npx`). Commands that talk only to this PC,
-    such as `curl http://localhost:3000`, still run. The check reads what a
-    command names, so a script that connects to the internet by itself (for
-    example `python fetch.py`) can still reach it. The message box says the
-    chat is offline, with a button to turn it back on.
+  - **Internet:** this is a filter, not a firewall. Turn it off and GAIA
+    refuses recognised web, browser, connector, mailbox, Agent Hub and
+    network-command tools (such as `git push`, `pip install` or `npx`).
+    Commands that talk only to this PC, such as `curl http://localhost:3000`,
+    still run. Skill tools, scripts and commands that hide their destination
+    may still reach the network because GAIA cannot inspect every operation.
+    The message box says the chat is offline, with a button to turn it back on.
   - **Phone access:** turns mobile access on or off, shows the QR code, and
     names the phone that connected. On the phone, **Add to Home Screen**
     (Safari's Share menu, or Chrome's menu) installs GAIA as an app that
@@ -937,7 +947,7 @@ GAIA reads every word or rejects the schedule and says what to change; it never 
 
 - Invalid times such as `25:00` or `9:75`, and a bare `at 9` (say `9am`, `9pm`, `9:00`, or `every morning at 9`).
 - A part of the day that disagrees with the time (`every morning at 8pm`), or one with no time (`every morning`).
-- One-time tasks (`tomorrow at noon`, `next friday`, `on feb 30`). Schedules repeat, so use a form like `every friday at 9am`.
+- One-time tasks (`tomorrow at noon`, `next friday`, `on feb 30`). Schedules here repeat, so use a form like `every friday at 9am`. To run a prompt once, use [`gaia schedule add --at`](/reference/cli#schedule) in a terminal.
 - Runs more often than once a minute. Each run is a full agent turn.
 - A weekly time with no day, such as `weekly at 9am` or `every 7d at 9am`. Name the day: `every monday at 9am`.
 - Combinations that can't be honored yet: `every other tuesday`, `every 2 days at 9am`, monthly schedules, and windows that don't start and end on the hour.
